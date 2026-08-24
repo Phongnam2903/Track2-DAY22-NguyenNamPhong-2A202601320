@@ -18,7 +18,7 @@ import sys
 import json
 import types
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from pathlib import Path
 
@@ -42,6 +42,7 @@ except ModuleNotFoundError:
 
 from ragas import evaluate, EvaluationDataset, SingleTurnSample
 from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision
+from ragas.run_config import RunConfig
 
 from utils.llm_factory import get_llm, get_embeddings
 from utils.data_loader import load_knowledge_base, split_text, build_vectorstore
@@ -186,6 +187,18 @@ def run_ragas_eval(rag_results: list, version: str) -> dict:
     llm_eval = get_llm(temperature=0)
     emb_eval = get_embeddings()
 
+    # RAGAS mặc định chạy 16 workers với timeout 180 giây. Cấu hình đó phù hợp
+    # với API cloud nhưng dễ làm Ollama local quá tải và trả về toàn bộ NaN.
+    is_ollama = config.PROVIDER == "ollama"
+    eval_run_config = RunConfig(
+        timeout=900 if is_ollama else 180,
+        max_retries=1 if is_ollama else 3,
+        max_wait=30,
+        max_workers=2 if is_ollama else 8,
+    )
+    if is_ollama:
+        print("  🦙 Ollama mode: max_workers=2, timeout=900s cho mỗi tác vụ")
+
     # TODO: Gọi evaluate() với đầy đủ 4 metrics
     # Gợi ý:
     #   result = evaluate(
@@ -199,6 +212,7 @@ def run_ragas_eval(rag_results: list, version: str) -> dict:
         metrics=[faithfulness, answer_relevancy, context_recall, context_precision],
         llm=llm_eval,
         embeddings=emb_eval,
+        run_config=eval_run_config,
     )
 
     # Tính mean score cho mỗi metric
@@ -206,7 +220,17 @@ def run_ragas_eval(rag_results: list, version: str) -> dict:
     scores = {}
     for key in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
         raw = result[key]
-        scores[key] = float(np.mean([v for v in raw if v is not None]))
+        valid_values = [
+            float(v)
+            for v in raw
+            if v is not None and np.isfinite(float(v))
+        ]
+        if not valid_values:
+            raise RuntimeError(
+                f"RAGAS không trả về giá trị hợp lệ cho metric '{key}'. "
+                "Hãy xem lỗi evaluator phía trên thay vì nộp báo cáo NaN."
+            )
+        scores[key] = float(np.mean(valid_values))
 
     # In kết quả
     print(f"\n📊 Kết quả RAGAS — Prompt {version.upper()}:")
@@ -264,7 +288,7 @@ def main():
     # TODO: Ghi report vào file bằng json.dumps hoặc json.dump
     # Gợi ý: report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     report_path.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False),
+        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False),
         encoding="utf-8",
     )
     print(f"💾 Đã lưu báo cáo vào {report_path}")
